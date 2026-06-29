@@ -1,0 +1,12 @@
+# never commit live credentials or runtime state
+accounts/
+*.auth.json
+auth.json
+*.log
+port
+locks/
+codex-home/
+reauth-notification.json
+*.lock
+__pycache__/
+.DS_Store

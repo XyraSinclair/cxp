@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""cxp-bridge — reachability guarantee for codex chats (strictly additive).
+
+WHY THIS CANNOT REGRESS ANYTHING
+--------------------------------
+A codex chat bakes the proxy URL (127.0.0.1:<port>) in at launch. If the proxy
+later moves off that port, the chat is stranded ("stream disconnected"). This
+service makes every port a chat *expects* reach the *live* proxy.
+
+It is non-regressive by construction:
+  * It ONLY binds a port that is currently FREE (a free port serves a chat
+    nothing, so adding a forwarder to it can only help, never harm).
+  * It NEVER binds a port that is in use -> it can't touch the live proxy or any
+    working chat/connection.
+  * It NEVER kills or restarts anything.
+  * It forwards to the proxy's CURRENT port, re-read live, with a self-loop guard.
+
+So the worst case for any chat is "exactly as broken as without this" and the
+best case is "restored". Monotonic improvement only.
+"""
+import asyncio
+import contextlib
+import json
+import os
+import re
+import socket
+import subprocess
+import time
+import pathlib
+
+BASE = pathlib.Path(os.environ["HOME"]) / ".codexpool"
+PORT_FILE = BASE / "port"
+CANONICAL_PORT = 51805          # the stable port the proxy prefers
+RESCAN_SECS = 3.0
+
+
+def proxy_port():
+    try:
+        return int(json.loads(PORT_FILE.read_text()).get("port"))
+    except Exception:
+        return None
+
+
+def expected_ports():
+    """Ports that currently-running codex chats expect to talk to."""
+    ports = set()
+    with contextlib.suppress(Exception):
+        cp = subprocess.run(["ps", "-axo", "command="],
+                            capture_output=True, text=True)
+        for m in re.finditer(r"base_url=http://127\.0\.0\.1:(\d+)", cp.stdout):
+            ports.add(int(m.group(1)))
+    ports.add(CANONICAL_PORT)
+    return ports
+
+
+def port_is_free(p):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", p))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+async def _pipe(reader, writer):
+    try:
+        while True:
+            data = await reader.read(65536)
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    except Exception:
+        pass
+    finally:
+        with contextlib.suppress(Exception):
+            writer.close()
+
+
+def _make_handler(listen_port):
+    async def handle(client_reader, client_writer):
+        target = proxy_port()
+        if not target or target == listen_port:   # self-loop / unknown: refuse
+            with contextlib.suppress(Exception):
+                client_writer.close()
+            return
+        try:
+            srv_reader, srv_writer = await asyncio.open_connection("127.0.0.1", target)
+        except Exception:
+            with contextlib.suppress(Exception):
+                client_writer.close()
+            return
+        await asyncio.gather(
+            _pipe(client_reader, srv_writer),
+            _pipe(srv_reader, client_writer),
+        )
+    return handle
+
+
+async def run():
+    servers = {}  # listen_port -> asyncio.Server
+    while True:
+        target = proxy_port()
+        for p in expected_ports():
+            if p in servers:
+                continue
+            if target is not None and p == target:
+                continue                       # the proxy owns this port; leave it
+            if not port_is_free(p):
+                continue                       # in use (proxy/other bridge/app): never touch
+            with contextlib.suppress(Exception):
+                srv = await asyncio.start_server(_make_handler(p), "127.0.0.1", p)
+                servers[p] = srv
+                print("bridge: bound %d -> proxy(%s)" % (p, target), flush=True)
+        await asyncio.sleep(RESCAN_SECS)
+
+
+def main():
+    # Outer guard: never exit cleanly (so launchd KeepAlive only restarts on real
+    # crashes, never busy-loops), and survive transient errors.
+    while True:
+        try:
+            asyncio.run(run())
+        except Exception as e:
+            print("bridge: loop crashed (%s); retrying" % e, flush=True)
+            time.sleep(2)
+
+
+if __name__ == "__main__":
+    main()

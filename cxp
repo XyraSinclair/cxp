@@ -1,0 +1,1867 @@
+#!/usr/bin/env python3
+"""
+cxp — codexpool: make several ChatGPT Pro accounts behave as one Codex login.
+
+A localhost token-injecting proxy. Codex is pointed at it via `chatgpt_base_url`.
+For each request the proxy picks an account by LIVE usage, injects that account's
+bearer token, and streams the response straight back. It is the SOLE refresher per
+account (so single-use rotating refresh tokens are never copied or raced — the bug
+that forced constant re-logins), and it rotates accounts only BETWEEN turns: on a
+real quota wall or when live usage drops under the spillover threshold.
+
+Design + rationale: ./DESIGN.md and ../analysis/TAXONOMY.md
+Protocol constants verified against vendored codex source (login/src/auth/manager.rs)
+and the proven codex-usage-probe.
+
+Usage:
+  cxp [codex args...]    launch codex through the pool (default)
+  cxp proxy              run the proxy in the foreground (normally auto-spawned)
+  cxp status             per-account live usage + routing + proxy health
+  cxp import             (re)seed the pool from ~/.codex/accounts/*.auth.json
+  cxp login [hint]       sign one account into the pool without touching ~/.codex
+  cxp auth-log           show recent auth/login events
+  cxp quarantine         move pooled ~/.codex credentials aside so cxp owns refresh
+  cxp unquarantine       restore files moved by `cxp quarantine`
+  cxp stop               stop the shared proxy and clean the port file
+  cxp restart            restart the shared proxy
+  cxp install-agent      install a launchd agent that keeps the proxy alive
+  cxp uninstall-agent    remove the launchd agent
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import calendar
+import collections
+import contextlib
+import fcntl
+import json
+import os
+import pathlib
+import plistlib
+import shlex
+import signal
+import socket
+import sys
+import time
+import urllib.parse
+from typing import Dict, List, Optional, Tuple
+
+import aiohttp
+from aiohttp import web
+
+# ---- protocol constants (verified against codex source) ---------------------
+BACKEND_ORIGIN = "https://chatgpt.com"
+BACKEND_BASE = BACKEND_ORIGIN + "/backend-api"
+WHAM_USAGE_URL = BACKEND_BASE + "/wham/usage"
+REFRESH_URL = "https://auth.openai.com/oauth/token"
+CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CXP_MANAGED_REFRESH_TOKEN = "cxp-managed-openai-codex-refresh"
+
+# ---- paths ------------------------------------------------------------------
+HOME = pathlib.Path(os.environ["HOME"])
+BASE = HOME / ".codexpool"
+ACCTS = BASE / "accounts"
+LOCKS = BASE / "locks"
+PORT_FILE = BASE / "port"
+LOG_FILE = BASE / "proxy.log"
+AUTH_EVENTS = BASE / "auth-events.log"
+NOTIFY_STATE = BASE / "reauth-notification.json"
+AGENT_PROGRAM = BASE / "cxp-agent"
+PROXY_LOCK = LOCKS / "proxy.lock"
+CODEX_ACCTS = HOME / ".codex" / "accounts"
+CODEX_AUTH = HOME / ".codex" / "auth.json"
+CODEX_AUTH_BAK = HOME / ".codex" / "auth.json.cxp-bak"
+CODEX_QUARANTINE = CODEX_ACCTS / ".cxp-quarantine"
+PLACEHOLDER_HOME = BASE / "codex-home"  # throwaway CODEX_HOME for launched codex
+AGENT_LABEL = "com.codexpool.proxy"
+AGENT_PLIST = HOME / "Library" / "LaunchAgents" / (AGENT_LABEL + ".plist")
+
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+USAGE_TTL = max(0.0, env_float("CXP_USAGE_TTL_SECONDS", 45.0))
+ROUTE_USAGE_TTL = max(0.0, env_float("CXP_ROUTE_USAGE_TTL_SECONDS", 5.0))
+SPILLOVER_HEADROOM_PCT = max(0, min(100, env_int("CXP_SPILLOVER_HEADROOM_PCT", 10)))
+CXP_AUTO_FIX = env_bool("CXP_AUTO_FIX", True)
+CXP_STATUS_AUTO_FIX = env_bool("CXP_STATUS_AUTO_FIX", CXP_AUTO_FIX)
+CXP_STATUS_AUTO_LOGIN = env_bool("CXP_STATUS_AUTO_LOGIN", False)
+NOTIFY_MIN_INTERVAL_SECONDS = max(0, env_int("CXP_NOTIFY_MIN_INTERVAL_SECONDS", 3600))
+ROUTES_MAX = 512
+SSE_PREFIX_MAX_BYTES = 64 * 1024
+SSE_PREFIX_MAX_SECONDS = 1.5
+QUOTA_ERROR_TYPES = {"response.failed", "error", "response.error"}
+ACCOUNT_STATES = {"allowed", "walled", "needs_reauth", "unknown"}
+HOP_BY_HOP = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade", "content-length",
+    "host", "authorization", "chatgpt-account-id",
+}
+
+
+def log(msg: str) -> None:
+    line = "%s %s" % (time.strftime("%H:%M:%S"), msg)
+    try:
+        with open(LOG_FILE, "a") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
+    if os.environ.get("CXP_VERBOSE"):
+        print(line, file=sys.stderr)
+
+
+def ensure_dirs() -> None:
+    for d in (BASE, ACCTS, LOCKS, PLACEHOLDER_HOME):
+        d.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(Exception):
+            os.chmod(d, 0o700)
+
+
+def audit_auth_event(event: str, **fields) -> None:
+    """Append a token-free auth audit event for login/reauth debugging."""
+    BASE.mkdir(parents=True, exist_ok=True)
+    clean = {}
+    for k, v in fields.items():
+        if "token" in k.lower():
+            continue
+        if v is None or isinstance(v, (str, int, float, bool)):
+            clean[k] = v
+        else:
+            clean[k] = str(v)
+    row = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "event": event,
+        **clean,
+    }
+    try:
+        with open(AUTH_EVENTS, "a") as fh:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+        with contextlib.suppress(Exception):
+            os.chmod(AUTH_EVENTS, 0o600)
+    except Exception:
+        pass
+
+
+def b64email(id_token: str) -> Optional[str]:
+    try:
+        mid = id_token.split(".")[1]
+        mid += "=" * (-len(mid) % 4)
+        return json.loads(base64.urlsafe_b64decode(mid)).get("email")
+    except Exception:
+        return None
+
+
+def jwt_payload(token: str) -> Optional[dict]:
+    try:
+        mid = token.split(".")[1]
+        mid += "=" * (-len(mid) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(mid))
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def token_expires_in(access_token: str, default: int = 3000) -> int:
+    exp = (jwt_payload(access_token) or {}).get("exp")
+    if isinstance(exp, (int, float)):
+        return max(0, int(exp - time.time()))
+    return default
+
+
+def token_valid_for(access_token: str, min_seconds: int = 60) -> bool:
+    if not access_token:
+        return False
+    payload = jwt_payload(access_token)
+    exp = (payload or {}).get("exp")
+    if isinstance(exp, (int, float)):
+        return exp - time.time() > min_seconds
+    return True
+
+
+def parse_oauth_refresh_body(body: bytes, content_type: str = "") -> dict:
+    text = body.decode("utf-8", "ignore")
+    ctype = (content_type or "").lower()
+
+    def parse_json():
+        with contextlib.suppress(Exception):
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                return obj
+        return None
+
+    def parse_form():
+        with contextlib.suppress(Exception):
+            data = urllib.parse.parse_qs(text, keep_blank_values=True)
+            return {k: v[-1] if v else "" for k, v in data.items()}
+        return None
+
+    if "json" in ctype:
+        return parse_json() or parse_form() or {}
+    if "x-www-form-urlencoded" in ctype:
+        return parse_form() or parse_json() or {}
+    return parse_json() or parse_form() or {}
+
+
+def wants_pool_managed_token(request: web.Request, body_data: dict) -> bool:
+    client = request.headers.get("X-CXP-Client", "").strip().lower()
+    if client in {"omp", "codexpool"}:
+        return True
+    flag = str(body_data.get("cxp_pool_token") or "").strip().lower()
+    return flag in {"1", "true", "yes", "omp"}
+
+
+def oauth_response_for_account(acct, refresh_token: Optional[str] = None) -> dict:
+    return {
+        "access_token": acct.access_token,
+        "refresh_token": refresh_token if refresh_token is not None else acct.refresh_token,
+        "id_token": acct.id_token,
+        "expires_in": token_expires_in(acct.access_token),
+        "token_type": "Bearer",
+    }
+
+
+def atomic_write_json(path: pathlib.Path, obj: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp.%d" % os.getpid())
+    with open(tmp, "w") as fh:
+        json.dump(obj, fh)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def atomic_write_bytes(path: pathlib.Path, data: bytes, mode: int = 0o600) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp.%d" % os.getpid())
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def next_available_path(path: pathlib.Path) -> pathlib.Path:
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    for n in range(1000):
+        suffix = ".bak.%s" % stamp if n == 0 else ".bak.%s.%d" % (stamp, n)
+        candidate = path.with_name(path.name + suffix)
+        if not candidate.exists():
+            return candidate
+    return path.with_name(path.name + ".bak.%s.%d" % (stamp, os.getpid()))
+
+
+def move_existing_aside(path: pathlib.Path) -> Optional[pathlib.Path]:
+    if not path.exists():
+        return None
+    dst = next_available_path(path)
+    os.replace(path, dst)
+    return dst
+
+
+def parse_last_refresh(doc: dict) -> Optional[float]:
+    stamp = doc.get("last_refresh")
+    if not stamp:
+        return None
+    with contextlib.suppress(Exception):
+        return float(calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")))
+    return None
+
+
+def is_fresher_doc(candidate_doc: dict, candidate_path: pathlib.Path,
+                   current_doc: dict, current_path: pathlib.Path) -> bool:
+    cand_refresh = parse_last_refresh(candidate_doc)
+    cur_refresh = parse_last_refresh(current_doc)
+    if cand_refresh is not None and cur_refresh is not None and cand_refresh != cur_refresh:
+        return cand_refresh > cur_refresh
+    return candidate_path.stat().st_mtime >= current_path.stat().st_mtime
+
+
+def extract_error_code_message(obj: dict) -> Tuple[Optional[str], Optional[str]]:
+    code = None
+    message = None
+    err = obj.get("error")
+    if isinstance(err, dict):
+        code = err.get("code")
+        message = err.get("message")
+    resp = obj.get("response")
+    if isinstance(resp, dict):
+        rerr = resp.get("error")
+        if isinstance(rerr, dict):
+            code = code or rerr.get("code")
+            message = message or rerr.get("message")
+    code = code or obj.get("code")
+    message = message or obj.get("message")
+    return ((str(code) if code is not None else None),
+            (str(message) if message is not None else None))
+
+
+def is_quota_signal(status: Optional[int], code: Optional[str],
+                    message: Optional[str], body_text: Optional[str]) -> bool:
+    code_l = (code or "").strip().lower()
+    hay = " ".join(x for x in (code or "", message or "", body_text or ""))
+    hay = hay.strip().lower()
+    if code_l in {
+        "insufficient_quota",
+        "usage_limit_reached",
+        "rate_limit_exceeded",
+        "quota_exceeded",
+        "limit_reached",
+    }:
+        return True
+    if any(tag in code_l for tag in ("quota", "usage_limit", "rate_limit", "limit_reached")):
+        return True
+    phrases = (
+        "insufficient quota",
+        "current quota",
+        "quota exceeded",
+        "usage limit",
+        "usage_limit",
+        "rate limit exceeded",
+        "rate_limit_exceeded",
+        "limit reached",
+        "usage has reached",
+    )
+    if any(p in hay for p in phrases):
+        return True
+    return False
+
+
+def iter_sse_json_events(buf: bytes):
+    text = buf.decode("utf-8", "ignore").replace("\r\n", "\n")
+    for block in text.split("\n\n")[:-1]:
+        parts = []
+        for line in block.split("\n"):
+            if line.startswith("data:"):
+                parts.append(line[5:].lstrip())
+        if not parts:
+            continue
+        payload = "\n".join(parts).strip()
+        if not payload or payload == "[DONE]":
+            continue
+        with contextlib.suppress(Exception):
+            obj = json.loads(payload)
+            if isinstance(obj, dict):
+                yield obj
+
+
+def sse_event_starts_output(event_type: str) -> bool:
+    return (
+        event_type.startswith("response.output_text.")
+        or event_type.startswith("response.output_item.")
+        or event_type.startswith("response.content_part.")
+    )
+
+
+def scan_sse_prefix(buf: bytes) -> Tuple[Optional[str], bool]:
+    for obj in iter_sse_json_events(buf):
+        ev_type = str(obj.get("type") or "")
+        if sse_event_starts_output(ev_type):
+            return None, True
+        code, message = extract_error_code_message(obj)
+        if ev_type in QUOTA_ERROR_TYPES or code or message:
+            if is_quota_signal(200, code, message, json.dumps(obj, separators=(",", ":"))):
+                return code or message or ev_type or "quota", False
+    return None, False
+
+
+def classify_sse_prefix(buf: bytes) -> Optional[str]:
+    reason, _ = scan_sse_prefix(buf)
+    return reason
+
+
+def extract_error_from_text(text: str) -> Tuple[Optional[str], Optional[str]]:
+    with contextlib.suppress(Exception):
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return extract_error_code_message(obj)
+    return None, None
+
+
+def mark_account_walled(acct, path: str, reason: Optional[str]) -> None:
+    acct.state = "walled"
+    acct.usage_at = time.time()
+    acct.walled_until = time.time() + 300
+    acct.persist()
+    why = (reason or "quota")[:80].replace("\n", " ")
+    log("WALL %s on %s -> reroute (%s)" % (path, acct.email, why))
+
+
+def clamp_pct(value: int) -> int:
+    return max(0, min(100, value))
+
+
+def utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def optional_int(value) -> Optional[int]:
+    if value is None:
+        return None
+    with contextlib.suppress(Exception):
+        return int(value)
+    return None
+
+
+def optional_float(value, default: float = 0.0) -> float:
+    with contextlib.suppress(Exception):
+        return float(value)
+    return default
+
+
+def mark_account_needs_reauth(acct, cooldown_seconds: float = 3600.0) -> None:
+    acct.state = "needs_reauth"
+    acct.usage_at = time.time()
+    acct.reauth_cooldown_until = max(
+        acct.reauth_cooldown_until,
+        time.time() + cooldown_seconds,
+    )
+    acct.persist()
+
+
+def should_spill_affinity(acct, candidates, threshold_pct: int) -> bool:
+    """Return true when a still-allowed sticky route should move to a roomier account."""
+    threshold_pct = clamp_pct(threshold_pct)
+    if acct.state != "allowed":
+        return True
+    if acct.headroom() >= threshold_pct:
+        return False
+    return any(
+        c.key != acct.key and c.state == "allowed" and c.headroom() > acct.headroom()
+        for c in candidates
+    )
+
+
+class RouteLRU(collections.OrderedDict):
+    def __init__(self, cap: int = ROUTES_MAX) -> None:
+        super().__init__()
+        self.cap = cap
+
+    def get(self, key, default=None):
+        if key not in self:
+            return default
+        value = super().__getitem__(key)
+        self.move_to_end(key)
+        return value
+
+    def remember(self, key: str, value: str) -> None:
+        super().__setitem__(key, value)
+        self.move_to_end(key)
+        while len(self) > self.cap:
+            self.popitem(last=False)
+
+
+# ============================================================================
+#  Account store — one credential file per account, owned by the proxy.
+# ============================================================================
+class Account:
+    def __init__(self, key: str, doc: dict):
+        self.key = key
+        tok = doc.get("tokens") or {}
+        self.account_id: str = tok.get("account_id") or ""
+        self.access_token: str = tok.get("access_token") or ""
+        self.refresh_token: str = tok.get("refresh_token") or ""
+        self.id_token: str = tok.get("id_token") or ""
+        self.email: str = b64email(self.id_token) or "?"
+        self.last_refresh: str = str(doc.get("last_refresh") or utc_now())
+        meta = doc.get("cxp") or {}
+        state = str(meta.get("state") or "unknown")
+        # live state
+        self.usage_5h: Optional[int] = optional_int(meta.get("usage_5h"))
+        self.usage_week: Optional[int] = optional_int(meta.get("usage_week"))
+        self.state: str = state if state in ACCOUNT_STATES else "unknown"
+        self.usage_at: float = optional_float(meta.get("usage_at"))
+        self.walled_until: float = optional_float(meta.get("walled_until"))
+        # don't re-spam refresh on a dead RT
+        self.reauth_cooldown_until: float = optional_float(
+            meta.get("reauth_cooldown_until"))
+        self.lock = None
+        self.lock_loop = None
+
+    def async_lock(self):
+        loop = asyncio.get_running_loop()
+        if self.lock is None or self.lock_loop is not loop:
+            self.lock = asyncio.Lock()
+            self.lock_loop = loop
+        return self.lock
+
+    def to_doc(self) -> dict:
+        return {
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "account_id": self.account_id,
+                "access_token": self.access_token,
+                "refresh_token": self.refresh_token,
+                "id_token": self.id_token,
+            },
+            "last_refresh": self.last_refresh,
+            "cxp": {
+                "state": self.state,
+                "usage_5h": self.usage_5h,
+                "usage_week": self.usage_week,
+                "usage_at": self.usage_at,
+                "walled_until": self.walled_until,
+                "reauth_cooldown_until": self.reauth_cooldown_until,
+            },
+        }
+
+    def to_auth_doc(self) -> dict:
+        doc = self.to_doc()
+        doc.pop("cxp", None)
+        return doc
+
+    def persist(self) -> None:
+        atomic_write_json(ACCTS / (self.key + ".json"), self.to_doc())
+
+    def headroom(self) -> int:
+        u = max(self.usage_5h or 0, self.usage_week or 0)
+        return max(0, 100 - u)
+
+
+def import_accounts(verbose: bool = True) -> int:
+    """Seed ~/.codexpool/accounts from ~/.codex/accounts (read-only source)."""
+    ensure_dirs()
+    n = 0
+    for f in sorted(CODEX_ACCTS.glob("*.auth.json")):
+        key = f.name[: -len(".auth.json")]
+        dst = ACCTS / (key + ".json")
+        if dst.exists():
+            continue  # never clobber a pool credential we may have refreshed
+        try:
+            doc = json.loads(f.read_text())
+        except Exception as e:
+            if verbose:
+                print("skip %s: %s" % (f.name, e))
+            continue
+        Account(key, doc).persist()
+        n += 1
+        if verbose:
+            print("imported %s" % key)
+    return n
+
+
+def import_active_auth(verbose: bool = True) -> int:
+    """Seed the pool from active ~/.codex/auth.json when it is a new account."""
+    ensure_dirs()
+    if not CODEX_AUTH.exists():
+        return 0
+    try:
+        doc = json.loads(CODEX_AUTH.read_text())
+    except Exception as e:
+        if verbose:
+            print("skip active auth: %s" % e)
+        return 0
+    tok = doc.get("tokens") or {}
+    if not tok.get("account_id") or not tok.get("refresh_token"):
+        return 0
+    key = account_key_from_doc(doc)
+    dst = ACCTS / (key + ".json")
+    if dst.exists():
+        return 0
+    Account(key, doc).persist()
+    audit_auth_event("import_active_auth", account=account_hint(Account(key, doc)),
+                     account_id=tok.get("account_id"), key=key)
+    if verbose:
+        print("imported active auth %s" % key)
+    return 1
+
+
+def iter_pool_docs():
+    for f in sorted(ACCTS.glob("*.json")):
+        if f.name.endswith(".tmp") or ".tmp." in f.name:
+            continue
+        key = f.name[: -len(".json")]
+        with contextlib.suppress(Exception):
+            yield key, f, json.loads(f.read_text())
+
+
+def load_pool() -> Dict[str, Account]:
+    pool: Dict[str, Account] = {}
+    acct_ids: Dict[str, Tuple[str, dict, pathlib.Path]] = {}
+    for key, f, doc in iter_pool_docs():
+        acct = Account(key, doc)
+        if acct.account_id:
+            cur = acct_ids.get(acct.account_id)
+            if cur:
+                cur_key, cur_doc, cur_path = cur
+                if is_fresher_doc(doc, f, cur_doc, cur_path):
+                    log("dedup: dropped %s (dup of %s)" % (cur_key, acct.account_id))
+                    pool.pop(cur_key, None)
+                    acct_ids[acct.account_id] = (key, doc, f)
+                else:
+                    log("dedup: dropped %s (dup of %s)" % (key, acct.account_id))
+                    continue
+            else:
+                acct_ids[acct.account_id] = (key, doc, f)
+        pool[key] = acct
+    return pool
+
+
+# ============================================================================
+#  Token + usage — the safety-critical core.
+# ============================================================================
+async def refresh_account(sess: aiohttp.ClientSession, acct: Account,
+                          notify: bool = True) -> bool:
+    """Refresh one account's token. Single-flight per account (asyncio lock) and
+    cross-process safe (file lock), so a rotating refresh token is never raced."""
+    async with acct.async_lock():
+        # cross-process lock so multiple cxp processes can't double-spend the RT
+        lockpath = LOCKS / (acct.key + ".lock")
+        lf = open(lockpath, "w")
+        try:
+            await asyncio.get_event_loop().run_in_executor(
+                None, fcntl.flock, lf.fileno(), fcntl.LOCK_EX
+            )
+            # re-read the freshest persisted token (a peer may have just rotated it)
+            with contextlib.suppress(Exception):
+                fresh = json.loads((ACCTS / (acct.key + ".json")).read_text())
+                acct.refresh_token = fresh["tokens"]["refresh_token"]
+            body = {"client_id": CLIENT_ID, "grant_type": "refresh_token",
+                    "refresh_token": acct.refresh_token}
+            try:
+                async with sess.post(REFRESH_URL, json=body,
+                                     headers={"Content-Type": "application/json"},
+                                     timeout=aiohttp.ClientTimeout(total=30)) as r:
+                    if r.status != 200:
+                        txt = (await r.text())[:200]
+                        log("refresh %s FAILED %d %s" % (acct.email, r.status, txt))
+                        if r.status in (400, 401):
+                            # dead/burned refresh token: stop hammering it until the
+                            # user re-logs in (or an hour passes).
+                            mark_account_needs_reauth(acct)
+                            audit_auth_event("refresh_needs_reauth",
+                                             account=account_hint(acct),
+                                             account_id=acct.account_id,
+                                             status=r.status)
+                            if notify:
+                                notify_reauth_needed([acct])
+                        return False
+                    data = await r.json()
+            except Exception as e:
+                log("refresh %s error %s" % (acct.email, e))
+                return False
+            acct.access_token = data.get("access_token") or acct.access_token
+            if data.get("refresh_token"):
+                acct.refresh_token = data["refresh_token"]   # rotate
+            if data.get("id_token"):
+                acct.id_token = data["id_token"]
+            acct.last_refresh = utc_now()
+            acct.persist()   # persist rotated RT BEFORE use (atomic)
+            log("refresh %s OK" % acct.email)
+            return True
+        finally:
+            with contextlib.suppress(Exception):
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+            lf.close()
+
+
+async def probe_usage(sess: aiohttp.ClientSession, acct: Account,
+                      allow_refresh: bool = True,
+                      max_age: float = USAGE_TTL,
+                      notify: bool = True) -> None:
+    """Refresh acct.state/usage from live wham/usage."""
+    if acct.state == "walled" and acct.walled_until and time.time() >= acct.walled_until:
+        acct.state = "unknown"
+        acct.persist()
+    if max_age > 0 and time.time() - acct.usage_at < max_age and acct.state != "unknown":
+        return
+    # burned/dead account: only cxp login should replace this credential.
+    if acct.state == "needs_reauth":
+        return
+    headers = {"Authorization": "Bearer " + acct.access_token,
+               "ChatGPT-Account-Id": acct.account_id,
+               "Accept": "application/json", "User-Agent": "cxp/0.1"}
+    try:
+        async with sess.get(WHAM_USAGE_URL, headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=15)) as r:
+            status = r.status
+            data = await r.json() if r.content_type == "application/json" else {}
+    except Exception as e:
+        log("usage %s error %s" % (acct.email, e))
+        return
+    if status == 401:
+        if allow_refresh and await refresh_account(sess, acct, notify=notify):
+            return await probe_usage(sess, acct, allow_refresh=False, max_age=0,
+                                     notify=notify)
+        if acct.state != "needs_reauth":
+            if allow_refresh:
+                log("usage %s got 401 but refresh did not confirm reauth" % acct.email)
+            else:
+                mark_account_needs_reauth(acct)
+        if acct.state == "needs_reauth":
+            audit_auth_event("usage_probe_needs_reauth",
+                             account=account_hint(acct),
+                             account_id=acct.account_id,
+                             status=status)
+            if notify:
+                notify_reauth_needed([acct])
+        return
+    rate = (data or {}).get("rate_limit") or {}
+    p = rate.get("primary_window") or {}
+    s = rate.get("secondary_window") or {}
+    acct.usage_5h = p.get("used_percent")
+    acct.usage_week = s.get("used_percent")
+    acct.usage_at = time.time()
+    if rate.get("allowed"):
+        acct.state = "allowed"
+        acct.walled_until = 0.0
+    elif rate.get("limit_reached"):
+        acct.state = "walled"
+        # remember the soonest reset so we re-probe after it
+        resets = [w.get("reset_at") for w in (p, s) if w.get("used_percent") == 100]
+        acct.walled_until = min([x for x in resets if x] or [time.time() + 300])
+    else:
+        acct.state = "unknown"
+    acct.persist()
+
+
+# ============================================================================
+#  Proxy server
+# ============================================================================
+class Proxy:
+    def __init__(self) -> None:
+        self.pool: Dict[str, Account] = load_pool()
+        self.routes = RouteLRU()           # thread_key -> account_key (affinity)
+        self.rr = 0                          # round-robin cursor for tie-breaks
+        self.ctrl: Optional[aiohttp.ClientSession] = None  # usage/refresh (decompress)
+        self.fwd: Optional[aiohttp.ClientSession] = None   # forwarding (raw bytes)
+
+    # --- account selection ---------------------------------------------------
+    async def refresh_all_usage(self, max_age: float = USAGE_TTL) -> None:
+        await asyncio.gather(*(probe_usage(self.ctrl, a, max_age=max_age)
+                               for a in self.pool.values()))
+
+    def allowed_accounts(self):
+        now = time.time()
+        out = []
+        for a in self.pool.values():
+            if a.state == "allowed":
+                out.append(a)
+            elif a.state == "walled" and a.walled_until and now >= a.walled_until:
+                a.state = "unknown"   # window reset; eligible for re-probe
+        return out
+
+    async def pick_account(self, thread_key: str) -> Optional[Account]:
+        # affinity: keep a chat on its account while that account is still allowed
+        cur = self.routes.get(thread_key)
+        if cur and cur in self.pool:
+            a = self.pool[cur]
+            await probe_usage(self.ctrl, a, max_age=ROUTE_USAGE_TTL)
+            if a.state == "allowed":
+                await self.refresh_all_usage(max_age=ROUTE_USAGE_TTL)
+                cands = self.allowed_accounts()
+                if not should_spill_affinity(a, cands, SPILLOVER_HEADROOM_PCT):
+                    return a
+                log("SPILL %s headroom=%d%% below %d%% -> reroute" % (
+                    a.email, a.headroom(), clamp_pct(SPILLOVER_HEADROOM_PCT)))
+                self.routes.pop(thread_key, None)
+        # otherwise (new chat, affinity account walled, or low-headroom spillover)
+        # pick the freshest high-headroom account. This switch still lands between
+        # turns because no upstream request has been opened yet.
+        await self.refresh_all_usage(max_age=ROUTE_USAGE_TTL)
+        cands = self.allowed_accounts()
+        if not cands:
+            return None
+        cands.sort(key=lambda a: a.headroom(), reverse=True)
+        # spread: among the top-headroom accounts, round-robin
+        top = [a for a in cands if a.headroom() >= cands[0].headroom() - 10] or cands
+        a = top[self.rr % len(top)]
+        self.rr += 1
+        self.routes.remember(thread_key, a.key)
+        return a
+
+    # --- request handling ----------------------------------------------------
+    def thread_key(self, body: bytes, request: web.Request) -> str:
+        with contextlib.suppress(Exception):
+            obj = json.loads(body)
+            for k in ("prompt_cache_key", "conversation_id", "session_id"):
+                if obj.get(k):
+                    return str(obj[k])
+        # fall back to the client connection (each codex process = one socket peer)
+        peer = request.transport.get_extra_info("peername") if request.transport else None
+        return "conn:%s" % (peer,)
+
+    async def handle(self, request: web.Request) -> web.StreamResponse:
+        path = request.rel_url.raw_path
+        # Codex routes its own token refresh here (CODEX_REFRESH_TOKEN_URL_OVERRIDE):
+        if path.endswith("/oauth/token"):
+            return await self.handle_refresh(request)
+        # WebSocket upgrade: decline so codex falls back to plain HTTP.
+        if request.headers.get("Upgrade", "").lower() == "websocket":
+            return web.Response(status=426, text="websocket not proxied; use http")
+
+        body = await request.read()
+        tkey = self.thread_key(body, request)
+
+        attempted = set()
+        for attempt in range(len(self.pool) + 1):
+            acct = await self.pick_account(tkey)
+            if acct is None:
+                return web.json_response(
+                    {"error": {"message": "codexpool: all accounts are out of usage "
+                               "right now (every account walled)."}}, status=429)
+            if acct.key in attempted:
+                # already tried everyone allowed; give up to avoid a loop
+                return web.json_response(
+                    {"error": {"message": "codexpool: no account could serve this turn."}},
+                    status=429)
+            attempted.add(acct.key)
+            resp = await self.forward(request, path, body, acct, tkey)
+            if resp is not None:
+                return resp
+            # forward() returned None => account walled; reassign and retry
+            self.routes.pop(tkey, None)
+        return web.json_response(
+            {"error": {"message": "codexpool: exhausted accounts."}}, status=429)
+
+    async def forward(self, request, path, body, acct, tkey):
+        """Forward to upstream on `acct`. Returns a response, or None to signal a
+        quota wall (caller should reassign to another account and retry)."""
+        url = BACKEND_ORIGIN + path
+        if request.rel_url.raw_query_string:
+            url += "?" + request.rel_url.raw_query_string
+        out_headers = {k: v for k, v in request.headers.items()
+                       if k.lower() not in HOP_BY_HOP}
+        # one 401-refresh retry on this same account
+        for tok_try in range(2):
+            out_headers["Authorization"] = "Bearer " + acct.access_token
+            out_headers["ChatGPT-Account-Id"] = acct.account_id
+            try:
+                up = await self.fwd.request(
+                    request.method, url, headers=out_headers,
+                    data=body if body else None, allow_redirects=False,
+                    timeout=aiohttp.ClientTimeout(total=None, sock_connect=30))
+            except Exception as e:
+                log("upstream error %s on %s: %s" % (path, acct.email, e))
+                return web.Response(status=502, text="codexpool upstream error")
+            if up.status == 401 and tok_try == 0:
+                up.release()
+                if await refresh_account(self.ctrl, acct):
+                    continue
+                if acct.state != "needs_reauth":
+                    log("forward %s got 401 but refresh did not confirm reauth" %
+                        acct.email)
+                return None  # try another account
+            break
+
+        # HTTP 429 is only a wall after the payload confirms it is quota-related.
+        if up.status == 429:
+            text = await up.text()
+            code, message = extract_error_from_text(text)
+            up.release()
+            if is_quota_signal(up.status, code, message, text):
+                mark_account_walled(acct, path, code or message)
+                return None
+            return web.Response(status=up.status, body=text.encode(),
+                                headers={k: v for k, v in up.headers.items()
+                                         if k.lower() not in
+                                         ("transfer-encoding", "content-length", "connection")})
+
+        prefix = bytearray()
+        prefix_iter = None
+        if up.status == 200 and up.content_type == "text/event-stream":
+            prefix_iter = up.content.iter_any()
+            started = time.monotonic()
+            while len(prefix) < SSE_PREFIX_MAX_BYTES and (
+                    time.monotonic() - started) < SSE_PREFIX_MAX_SECONDS:
+                try:
+                    chunk = await prefix_iter.__anext__()
+                except StopAsyncIteration:
+                    break
+                prefix.extend(chunk)
+                reason, output_started = scan_sse_prefix(bytes(prefix))
+                if reason:
+                    up.release()
+                    mark_account_walled(acct, path, reason)
+                    return None
+                # Once real output has started upstream, rerouting is no longer safe
+                # even if a later event in the same stream eventually walls.
+                if output_started:
+                    break
+
+        # stream the response straight back, unbuffered (SSE-safe)
+        resp = web.StreamResponse(status=up.status)
+        for k, v in up.headers.items():
+            if k.lower() in ("transfer-encoding", "content-length", "connection"):
+                continue
+            resp.headers[k] = v
+        await resp.prepare(request)
+        log("%s %s -> %s [%d]" % (request.method, path, acct.email, up.status))
+        try:
+            if prefix:
+                await resp.write(bytes(prefix))
+            source = prefix_iter if prefix_iter is not None else up.content.iter_any()
+            async for chunk in source:
+                await resp.write(chunk)
+        except Exception as e:
+            log("stream interrupted %s: %s" % (path, e))
+        finally:
+            up.release()
+        with contextlib.suppress(Exception):
+            await resp.write_eof()
+        return resp
+
+    async def handle_refresh(self, request: web.Request):
+        """Serve codex's own token refresh centrally so codex never races the RT."""
+        body = await request.read()
+        body_data = parse_oauth_refresh_body(body, request.content_type)
+        rt = body_data.get("refresh_token")
+        wants_pool_token = wants_pool_managed_token(request, body_data)
+        acct = None
+        if rt and not wants_pool_token:
+            for a in self.pool.values():
+                if a.refresh_token == rt:
+                    acct = a
+                    break
+        if acct is None and wants_pool_token:
+            peer = request.transport.get_extra_info("peername") if request.transport else None
+            acct = await self.pick_account("oauth-token:%s" % (peer,))
+        if acct is None:
+            # unknown RT: forward verbatim (don't break codex), but this is rare.
+            async with self.ctrl.post(REFRESH_URL, data=body,
+                                      headers={"Content-Type": request.headers.get(
+                                          "Content-Type", "application/json")}) as r:
+                return web.Response(status=r.status, body=await r.read(),
+                                    content_type=r.content_type)
+        if not token_valid_for(acct.access_token):
+            refreshed = await refresh_account(self.ctrl, acct)
+            if not refreshed:
+                peer = request.transport.get_extra_info("peername") if request.transport else None
+                fallback = await self.pick_account("oauth-token-fallback:%s" % (peer,))
+                if fallback and fallback.key != acct.key:
+                    acct = fallback
+                    if not token_valid_for(acct.access_token):
+                        refreshed = await refresh_account(self.ctrl, acct)
+                if not token_valid_for(acct.access_token):
+                    return web.json_response(
+                        {"error": "codexpool_no_refreshable_accounts"},
+                        status=401,
+                    )
+        refresh_out = CXP_MANAGED_REFRESH_TOKEN if wants_pool_token else acct.refresh_token
+        return web.json_response(oauth_response_for_account(acct, refresh_token=refresh_out))
+
+
+async def run_proxy() -> None:
+    ensure_dirs()
+    # --- HARD SINGLETON: exactly one proxy may ever manage the token pool ------
+    # Two proxies sharing the pool double-spend rotating refresh tokens and
+    # permanently burn accounts (forcing a browser re-login). The flock below is
+    # a secondary guard only: a reinstall recreates ~/.codexpool and orphans the
+    # lock inode, so flock alone is NOT reliable. The authoritative check is a
+    # live-process scan (find_known_proxy_pids), which cannot be defeated by an
+    # unlinked lock file. If any other cxp proxy is alive, we refuse to start.
+    proxy_lock = open(PROXY_LOCK, "w")
+    with contextlib.suppress(Exception):
+        fcntl.flock(proxy_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    others = [p for p in find_known_proxy_pids() if pid_alive(p)]
+    if others:
+        msg = "another cxp proxy is already running (pid %s)" % \
+              ", ".join(str(p) for p in others)
+        log("singleton: refusing to start; %s" % msg)
+        print("cxp: %s; not starting a second instance." % msg, file=sys.stderr)
+        with contextlib.suppress(Exception):
+            fcntl.flock(proxy_lock.fileno(), fcntl.LOCK_UN)
+        proxy_lock.close()
+        return
+    import_accounts(verbose=False)
+    proxy = Proxy()
+    if not proxy.pool:
+        print("cxp: no accounts in pool; run `cxp import` after `codex login`.",
+              file=sys.stderr)
+        sys.exit(1)
+    proxy.ctrl = aiohttp.ClientSession(auto_decompress=True)
+    proxy.fwd = aiohttp.ClientSession(auto_decompress=False)
+    app = web.Application(client_max_size=1024 ** 3)
+    app.router.add_route("*", "/{tail:.*}", proxy.handle)
+    runner = web.AppRunner(app)
+    port = None
+    await runner.setup()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # STABLE PORT. Existing codex chats bake the proxy URL in at launch, so a proxy
+    # restart on a fresh ephemeral port strands every live chat ("stream
+    # disconnected ... 127.0.0.1:<old>"). Bind a fixed port so restarts are
+    # transparent to running chats. Fall back to ephemeral only if it is taken.
+    preferred = env_int("CXP_PROXY_PORT", 51805)
+    try:
+        sock.bind(("127.0.0.1", preferred))
+    except OSError:
+        log("preferred port %d unavailable; falling back to ephemeral" % preferred)
+        sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    site = web.TCPSite(runner, "127.0.0.1", port)
+    await site.start()
+    atomic_write_json(PORT_FILE, {"port": port, "pid": os.getpid()})
+    log("proxy up on 127.0.0.1:%d with %d accounts" % (port, len(proxy.pool)))
+    print("cxp proxy listening on 127.0.0.1:%d (%d accounts)" % (port, len(proxy.pool)),
+          file=sys.stderr)
+    stop = asyncio.Event()
+    loop = asyncio.get_event_loop()
+    for s in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(s, stop.set)
+    try:
+        await stop.wait()
+    finally:
+        await proxy.ctrl.close()
+        await proxy.fwd.close()
+        await runner.cleanup()
+        with contextlib.suppress(Exception):
+            if isinstance(port, int) and port_record_owned_by(port, os.getpid()):
+                PORT_FILE.unlink()
+        with contextlib.suppress(Exception):
+            fcntl.flock(proxy_lock.fileno(), fcntl.LOCK_UN)
+        proxy_lock.close()
+
+
+# ============================================================================
+#  Launcher + status (sync helpers)
+# ============================================================================
+def read_port_record() -> Optional[dict]:
+    try:
+        raw = PORT_FILE.read_text().strip()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    with contextlib.suppress(Exception):
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            return obj
+    with contextlib.suppress(Exception):
+        return {"port": int(raw)}
+    return None
+
+
+def find_pid_for_port(port: int) -> Optional[int]:
+    import subprocess
+    with contextlib.suppress(Exception):
+        cp = subprocess.run(
+            ["lsof", "-tiTCP:%d" % port, "-sTCP:LISTEN"],
+            check=False, capture_output=True, text=True,
+        )
+        for line in cp.stdout.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                return int(line)
+    return None
+
+
+def known_proxy_script_paths() -> set:
+    paths = {str(AGENT_PROGRAM)}
+    with contextlib.suppress(Exception):
+        paths.add(os.path.realpath(__file__))
+    return {os.path.realpath(p) for p in paths}
+
+
+def is_known_cxp_proxy_command(command: str) -> bool:
+    with contextlib.suppress(Exception):
+        parts = shlex.split(command)
+        targets = known_proxy_script_paths()
+        for idx, part in enumerate(parts[:-1]):
+            if parts[idx + 1] != "proxy":
+                continue
+            real = os.path.realpath(part)
+            if real in targets:
+                return True
+            if pathlib.Path(part).name in {"cxp", "cxp-agent"}:
+                if "/.codexpool/" in part or "/codexpool/" in part:
+                    return True
+    return False
+
+
+def process_command(pid: int) -> str:
+    import subprocess
+    with contextlib.suppress(Exception):
+        cp = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            check=False, capture_output=True, text=True,
+        )
+        return cp.stdout.strip()
+    return ""
+
+
+def process_is_known_cxp_proxy(pid: int) -> bool:
+    return is_known_cxp_proxy_command(process_command(pid))
+
+
+def find_known_proxy_pids() -> List[int]:
+    import subprocess
+    pids: List[int] = []
+    with contextlib.suppress(Exception):
+        cp = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            check=False, capture_output=True, text=True,
+        )
+        for line in cp.stdout.splitlines():
+            text = line.strip()
+            pid_s, _, command = text.partition(" ")
+            if not pid_s.isdigit():
+                continue
+            pid = int(pid_s)
+            if pid != os.getpid() and is_known_cxp_proxy_command(command):
+                pids.append(pid)
+    return sorted(set(pids))
+
+
+def pid_alive(pid: int) -> bool:
+    with contextlib.suppress(OSError):
+        os.kill(pid, 0)
+        return True
+    return False
+
+
+def port_record_owned_by(port: int, pid: int) -> bool:
+    rec = read_port_record() or {}
+    return rec.get("port") == port and rec.get("pid") == pid
+
+
+def proxy_alive() -> Optional[int]:
+    rec = read_port_record()
+    if not rec:
+        return None
+    port = rec.get("port")
+    if not isinstance(port, int):
+        return None
+    pid = rec.get("pid")
+    listener_pid = find_pid_for_port(port)
+    if isinstance(pid, int):
+        if not pid_alive(pid):
+            return None
+        if isinstance(listener_pid, int) and listener_pid != pid:
+            return None
+        if not process_is_known_cxp_proxy(pid):
+            return None
+    elif isinstance(listener_pid, int) and not process_is_known_cxp_proxy(listener_pid):
+        return None
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.5)
+    try:
+        s.connect(("127.0.0.1", port))
+        return port
+    except Exception:
+        return None
+    finally:
+        s.close()
+
+
+def shell_cmd(*parts: str) -> str:
+    return " ".join(shlex.quote(str(p)) for p in parts)
+
+
+def osa_string(s: str) -> str:
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def account_hint(acct: Account) -> str:
+    if acct.email and acct.email != "?":
+        return acct.email
+    return acct.key
+
+
+def ownership_conflicts_for_pool(pool: Dict[str, Account]) -> dict:
+    """Find places where vanilla Codex can still refresh pooled credentials."""
+    pooled_keys = set(pool.keys())
+    pooled_ids = {a.account_id for a in pool.values() if a.account_id}
+    account_files = []
+    for key in sorted(pooled_keys):
+        if (CODEX_ACCTS / (key + ".auth.json")).exists():
+            account_files.append(key)
+
+    active_auth = None
+    with contextlib.suppress(Exception):
+        doc = json.loads(CODEX_AUTH.read_text())
+        tok = doc.get("tokens") or {}
+        account_id = tok.get("account_id")
+        if account_id and account_id in pooled_ids:
+            active_auth = {
+                "account_id": account_id,
+                "email": b64email(tok.get("id_token", "")) or "?",
+            }
+    return {"account_files": account_files, "active_auth": active_auth}
+
+
+def has_ownership_conflicts(conflicts: dict) -> bool:
+    return bool(conflicts.get("account_files") or conflicts.get("active_auth"))
+
+
+def autoheal_ownership(pool: Dict[str, Account], source: str) -> Tuple[Dict[str, Account], dict]:
+    conflicts = ownership_conflicts_for_pool(pool)
+    if has_ownership_conflicts(conflicts):
+        print("autoheal: moving shared vanilla Codex credentials under cxp ownership.")
+        audit_auth_event("%s_auto_quarantine" % source,
+                         account_files=len(conflicts.get("account_files") or []),
+                         active_auth=bool(conflicts.get("active_auth")))
+        cmd_quarantine()
+        pool = load_pool()
+        conflicts = ownership_conflicts_for_pool(pool)
+    return pool, conflicts
+
+
+def status_fix_lines(pool: Dict[str, Account], port: Optional[int],
+                     conflicts: dict, skipped_refresh: bool) -> List[str]:
+    lines: List[str] = []
+    needs = sorted(
+        (a for a in pool.values() if a.state == "needs_reauth"),
+        key=lambda a: account_hint(a),
+    )
+    unknown = sorted(
+        (a for a in pool.values() if a.state == "unknown"),
+        key=lambda a: account_hint(a),
+    )
+    walled = sorted(
+        (a for a in pool.values() if a.state == "walled"),
+        key=lambda a: account_hint(a),
+    )
+
+    if has_ownership_conflicts(conflicts):
+        account_file_count = len(conflicts.get("account_files") or [])
+        active = conflicts.get("active_auth")
+        detail = "%d ~/.codex/accounts file(s)" % account_file_count
+        if active:
+            detail += " plus ~/.codex/auth.json"
+        lines.append("auth ownership conflict: vanilla Codex can still refresh %s." % detail)
+        lines.append("Run these before trusting any REAUTH row:")
+        lines.append("  " + shell_cmd("cxp", "stop"))
+        lines.append("  " + shell_cmd("cxp", "quarantine"))
+        lines.append("  " + shell_cmd("cxp", "install-agent"))
+        lines.append("  " + shell_cmd("cxp", "status"))
+        if skipped_refresh:
+            lines.append("Status did not refresh tokens while ownership is shared.")
+        if needs:
+            lines.append("If rows are still REAUTH after that, refresh only those accounts:")
+            for acct in needs:
+                lines.append("  " + shell_cmd("cxp", "login", account_hint(acct)))
+            lines.append("  " + shell_cmd("cxp", "status"))
+        return lines
+
+    if needs:
+        lines.append("login required for REAUTH rows:")
+        for acct in needs:
+            lines.append("  " + shell_cmd("cxp", "login", account_hint(acct)))
+        lines.append("  " + shell_cmd("cxp", "status"))
+    else:
+        lines.append("login: no account currently needs `cxp login`.")
+
+    if not port:
+        lines.append("proxy is not running:")
+        lines.append("  " + shell_cmd("cxp", "install-agent"))
+        lines.append("  " + shell_cmd("cxp", "status"))
+        lines.append("one-shot alternative:")
+        lines.append("  " + shell_cmd("cxp", "restart"))
+
+    if unknown:
+        lines.append("unknown usage rows: restart the proxy, then inspect the proxy log if they stay unknown:")
+        lines.append("  " + shell_cmd("cxp", "restart"))
+        lines.append("  " + shell_cmd("tail", "-n", "80", str(LOG_FILE)))
+
+    if walled:
+        lines.append("walled rows are quota windows, not auth failures; cxp should route around them.")
+
+    if not needs and port and not unknown:
+        lines.append("fix: no immediate command needed.")
+    return lines
+
+
+def print_status_fixes(pool: Dict[str, Account], port: Optional[int],
+                       conflicts: dict, skipped_refresh: bool) -> None:
+    print("\nfix commands")
+    print("-" * 63)
+    for line in status_fix_lines(pool, port, conflicts, skipped_refresh):
+        print(line)
+
+
+def notify_process_alive(pid: Optional[int]) -> bool:
+    return isinstance(pid, int) and pid_alive(pid)
+
+
+def notify_reauth_needed(accounts) -> None:
+    """Show a sticky macOS alert for accounts that need browser login."""
+    accounts = [a for a in accounts if a.state == "needs_reauth"]
+    if not accounts or sys.platform != "darwin":
+        return
+    ensure_dirs()
+    keys = {a.key for a in accounts}
+    names_by_key = {a.key: account_hint(a) for a in accounts}
+    with contextlib.suppress(Exception):
+        state = json.loads(NOTIFY_STATE.read_text())
+        old_keys = {k for k in str(state.get("fingerprint") or "").split(",") if k}
+        keys |= old_keys
+        for name in state.get("accounts") or []:
+            names_by_key.setdefault(str(name), str(name))
+        age = time.time() - float(state.get("shown_ts") or 0)
+        if state.get("fingerprint") == ",".join(sorted(keys)):
+            return
+        if age < NOTIFY_MIN_INTERVAL_SECONDS:
+            state["fingerprint"] = ",".join(sorted(keys))
+            state["accounts"] = sorted(names_by_key.values())
+            atomic_write_json(NOTIFY_STATE, state)
+            return
+    fingerprint = ",".join(sorted(keys))
+    names = ", ".join(sorted(names_by_key.values()))
+    message = (
+        "codexpool needs browser login for: %s. "
+        "This dialog is one-shot for the current account set and will not open "
+        "Terminal, browser tabs, or recursive repair commands."
+    ) % names
+    script = (
+        "display dialog %s buttons {\"OK\"} default button \"OK\" "
+        "with title \"codexpool login required\" with icon caution\n"
+    ) % osa_string(message)
+    try:
+        import subprocess
+        proc = subprocess.Popen(
+            ["osascript", "-e", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        atomic_write_json(NOTIFY_STATE, {
+            "fingerprint": fingerprint,
+            "pid": proc.pid,
+            "accounts": sorted(names_by_key.values()),
+            "shown_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "shown_ts": time.time(),
+        })
+        audit_auth_event("reauth_notification_shown", accounts=names, pid=proc.pid)
+    except Exception as e:
+        audit_auth_event("reauth_notification_failed", accounts=names, error=str(e))
+
+
+def agent_needs_install() -> bool:
+    if not AGENT_PLIST.exists():
+        return True
+    if not AGENT_PROGRAM.exists():
+        return True
+    with contextlib.suppress(Exception):
+        if pathlib.Path(os.path.realpath(__file__)).stat().st_mtime > AGENT_PROGRAM.stat().st_mtime:
+            return True
+    try:
+        data = plistlib.loads(AGENT_PLIST.read_bytes())
+    except Exception:
+        return True
+    expected = [str(AGENT_PROGRAM), "proxy"]
+    # Accept either legacy KeepAlive=True or the crash-only dict form. Anything
+    # truthy means supervision is present; only a missing/false value needs a
+    # reinstall. (A strict == True check would reinstall on every launch and
+    # bounce the proxy via cmd_stop, churning tokens.)
+    keepalive = data.get("KeepAlive")
+    keepalive_ok = keepalive is True or isinstance(keepalive, dict) and bool(keepalive)
+    return (
+        data.get("ProgramArguments") != expected
+        or data.get("RunAtLoad") is not True
+        or not keepalive_ok
+    )
+
+
+def ensure_proxy() -> int:
+    port = proxy_alive()
+    if port:
+        return port
+    # spawn detached
+    import subprocess
+    subprocess.Popen([sys.executable, os.path.realpath(__file__), "proxy"],
+                     stdout=open(LOG_FILE, "a"), stderr=subprocess.STDOUT,
+                     start_new_session=True)
+    for _ in range(100):
+        time.sleep(0.1)
+        port = proxy_alive()
+        if port:
+            return port
+    print("cxp: proxy failed to start; see %s" % LOG_FILE, file=sys.stderr)
+    sys.exit(1)
+
+
+def write_placeholder_auth() -> None:
+    """Give the launched codex a CODEX_HOME with a valid-looking auth.json so it
+    doesn't prompt login. The proxy overrides the bearer on every backend call and
+    serves codex's own refreshes, so this token is only a 'don't prompt' placeholder."""
+    pool = load_pool()
+    if not pool:
+        return
+    auth = PLACEHOLDER_HOME / "auth.json"
+    # Prefer the user's currently-active codex account (usually healthy & refreshable)
+    # so codex starts cleanly; the proxy overrides the real bearer per request anyway.
+    real = HOME / ".codex" / "auth.json"
+    with contextlib.suppress(Exception):
+        if real.exists():
+            doc = json.loads(real.read_text())
+            if (doc.get("tokens") or {}).get("access_token"):
+                doc.pop("cxp", None)
+                atomic_write_json(auth, doc)
+                _copy_real_config()
+                return
+    acct = sorted(pool.values(), key=lambda a: a.key)[0]
+    atomic_write_json(auth, acct.to_auth_doc())
+    _copy_real_config()
+
+
+def _copy_real_config() -> None:
+    """Mirror the user's real ~/.codex/config.toml so models/settings are unchanged."""
+    real_cfg = HOME / ".codex" / "config.toml"
+    dst_cfg = PLACEHOLDER_HOME / "config.toml"
+    with contextlib.suppress(Exception):
+        if real_cfg.exists():
+            dst_cfg.write_text(real_cfg.read_text())
+
+
+def real_codex_path() -> str:
+    """Absolute path to the REAL codex binary, skipping our own shim dir
+    (~/.codexpool/bin). The transparent `codex` shim routes through cxp, and cxp
+    re-execs codex; without skipping the shim dir that would recurse forever."""
+    shim_dir = os.path.realpath(str(BASE / "bin"))
+    for d in (os.environ.get("PATH") or "").split(os.pathsep):
+        if not d:
+            continue
+        with contextlib.suppress(Exception):
+            if os.path.realpath(d) == shim_dir:
+                continue
+        cand = os.path.join(d, "codex")
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    for fb in (os.path.expanduser("~/.nvm/versions/node/v24.13.1/bin/codex"),):
+        if os.path.isfile(fb):
+            return fb
+    return "codex"
+
+
+def launch(codex_args, apply_preset: bool = True) -> None:
+    ensure_dirs()
+    import_accounts(verbose=False)
+    import_active_auth(verbose=False)
+    if CXP_AUTO_FIX:
+        pool = load_pool()
+        if pool:
+            autoheal_ownership(pool, "launch")
+        if agent_needs_install():
+            print("autoheal: installing launchd supervision for the cxp proxy.")
+            audit_auth_event("launch_auto_install_agent", plist=str(AGENT_PLIST))
+            cmd_install_agent()
+    port = ensure_proxy()
+    write_placeholder_auth()
+    # Route codex through the proxy via a CUSTOM provider with websockets DISABLED.
+    # (Codex's responses WebSocket is hardcoded to wss://chatgpt.com and ignores
+    # chatgpt_base_url, so it would bypass the proxy. requires_openai_auth=true makes
+    # the custom provider use the ChatGPT tokens; the proxy injects the real bearer.)
+    pbase = "http://127.0.0.1:%d/backend-api/codex" % port
+    env = dict(os.environ)
+    env["CODEX_HOME"] = str(PLACEHOLDER_HOME)
+    env["CODEX_REFRESH_TOKEN_URL_OVERRIDE"] = "http://127.0.0.1:%d/oauth/token" % port
+    env["NO_PROXY"] = "127.0.0.1,localhost,::1"
+    env["no_proxy"] = env["NO_PROXY"]
+    # Pool-routing essentials — ALWAYS injected so the single proxy is the only
+    # token refresher (this is what makes accounts stop getting burned).
+    provider = [
+        "-c", "model_providers.codexpool.name=codexpool",
+        "-c", "model_providers.codexpool.base_url=" + pbase,
+        "-c", 'model_providers.codexpool.wire_api="responses"',
+        "-c", "model_providers.codexpool.requires_openai_auth=true",
+        "-c", "model_providers.codexpool.supports_websockets=false",
+        "-c", "model_provider=codexpool",
+    ]
+    # Interactive cosmetics. Skipped in passthrough mode (the transparent shim)
+    # so `codex exec --full-auto -m gpt-5.4 ...` keeps the caller's OWN flags.
+    preset = [
+        "--dangerously-bypass-approvals-and-sandbox",
+        "-c", "model_reasoning_summary=detailed",
+        "-c", "model_reasoning_effort=xhigh",
+        "-m", "gpt-5.5",
+    ] if apply_preset else []
+    real = real_codex_path()
+    argv = [real] + provider + preset + list(codex_args)
+    os.execve(real, argv, env)
+
+
+def account_key_from_doc(doc: dict) -> str:
+    """Codex's stable account key: base64url(sub::account_id) from the id_token."""
+    tok = doc.get("tokens") or {}
+    sub = None
+    with contextlib.suppress(Exception):
+        mid = tok.get("id_token", "").split(".")[1]
+        mid += "=" * (-len(mid) % 4)
+        sub = json.loads(base64.urlsafe_b64decode(mid)).get("sub")
+    raw = ("%s::%s" % (sub or "user", tok.get("account_id") or "")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def cmd_login(hint: Optional[str]) -> None:
+    """Browser-OAuth an account into the pool (revives a burned/expired account).
+    Runs `codex login` in a throwaway CODEX_HOME so nothing else is disturbed."""
+    ensure_dirs()
+    import shutil
+    import subprocess
+    tmp = BASE / "login-tmp"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    print("Opening a browser to sign in%s. Pick the account you want to add."
+          % ((" for %s" % hint) if hint else ""))
+    audit_auth_event("login_start", hint=hint or "")
+    env = dict(os.environ)
+    env["CODEX_HOME"] = str(tmp)
+    env.pop("CODEX_REFRESH_TOKEN_URL_OVERRIDE", None)  # real login, no proxy override
+    cp = subprocess.run([real_codex_path(), "login"], env=env)
+    auth = tmp / "auth.json"
+    if not auth.exists():
+        print("login did not complete (no auth.json produced).")
+        audit_auth_event("login_failed", hint=hint or "", returncode=cp.returncode,
+                         reason="no_auth_json")
+        shutil.rmtree(tmp, ignore_errors=True)
+        return
+    doc = json.loads(auth.read_text())
+    key = account_key_from_doc(doc)
+    Account(key, doc).persist()
+    email = b64email((doc.get("tokens") or {}).get("id_token", "")) or "?"
+    if hint and "@" in hint and email.lower() != hint.lower():
+        print("warning: browser returned %s, not requested hint %s." % (email, hint))
+        audit_auth_event("login_hint_mismatch", hint=hint, account=email, key=key)
+    audit_auth_event("login_complete", hint=hint or "", account=email,
+                     account_id=(doc.get("tokens") or {}).get("account_id"), key=key,
+                     returncode=cp.returncode)
+    shutil.rmtree(tmp, ignore_errors=True)
+    print("Added/refreshed %s in the pool. Run `cxp status` to confirm." % email)
+
+
+def status_auto_login_enabled() -> bool:
+    return CXP_STATUS_AUTO_LOGIN and sys.stdin.isatty()
+
+
+def status_probe_pool_quiet(pool: Dict[str, Account], allow_refresh: bool) -> None:
+    async def go():
+        async with aiohttp.ClientSession(auto_decompress=True) as s:
+            await asyncio.gather(*(probe_usage(s, a, allow_refresh=allow_refresh,
+                                               notify=False)
+                                   for a in pool.values()))
+    asyncio.run(go())
+
+
+def cmd_status() -> None:
+    ensure_dirs()
+    import_accounts(verbose=False)
+    import_active_auth(verbose=False)
+    pool = load_pool()
+    if not pool:
+        if status_auto_login_enabled():
+            print("autoheal: no pool accounts; starting login.")
+            audit_auth_event("status_auto_login_start", reason="empty_pool")
+            cmd_login(None)
+            import_active_auth(verbose=False)
+            pool = load_pool()
+        if not pool:
+            print("no accounts in pool.")
+            print("\nfix commands")
+            print("-" * 63)
+            print(shell_cmd("cxp", "login"))
+            print(shell_cmd("cxp", "status"))
+            print("\nIf you already logged in with vanilla Codex instead:")
+            print(shell_cmd("cxp", "import"))
+            print(shell_cmd("cxp", "quarantine"))
+            print(shell_cmd("cxp", "install-agent"))
+            print(shell_cmd("cxp", "status"))
+            return
+
+    if CXP_STATUS_AUTO_FIX:
+        pool, conflicts = autoheal_ownership(pool, "status")
+    else:
+        conflicts = ownership_conflicts_for_pool(pool)
+
+    if CXP_STATUS_AUTO_FIX and agent_needs_install():
+        print("autoheal: installing launchd supervision for the cxp proxy.")
+        audit_auth_event("status_auto_install_agent", plist=str(AGENT_PLIST))
+        cmd_install_agent()
+
+    allow_status_refresh = not has_ownership_conflicts(conflicts)
+    status_probe_pool_quiet(pool, allow_refresh=allow_status_refresh)
+
+    needs = [a for a in pool.values() if a.state == "needs_reauth"]
+    if needs:
+        audit_auth_event("status_reauth_needed",
+                         accounts=", ".join(account_hint(a) for a in needs),
+                         count=len(needs))
+        if status_auto_login_enabled():
+            print("autoheal: starting browser login for %d account(s)." % len(needs))
+            for acct in sorted(needs, key=account_hint):
+                audit_auth_event("status_auto_login_start",
+                                 account=account_hint(acct),
+                                 account_id=acct.account_id)
+                cmd_login(account_hint(acct))
+            pool = load_pool()
+            conflicts = ownership_conflicts_for_pool(pool)
+            allow_status_refresh = not has_ownership_conflicts(conflicts)
+            status_probe_pool_quiet(pool, allow_refresh=allow_status_refresh)
+        else:
+            notify_reauth_needed(needs)
+
+    needs_after_login = [a for a in pool.values() if a.state == "needs_reauth"]
+    if needs_after_login:
+        notify_reauth_needed(needs_after_login)
+
+    port = proxy_alive()
+    print("codexpool — proxy: %s" % ("up on 127.0.0.1:%d" % port if port else "not running"))
+    print("routing — spill below %d%% headroom; route usage ttl %.1fs" % (
+        SPILLOVER_HEADROOM_PCT, ROUTE_USAGE_TTL))
+    if has_ownership_conflicts(conflicts):
+        print("auth owner — conflict; status probe used no-refresh mode")
+    else:
+        print("auth owner — ok; cxp is the only known refresher for pooled accounts")
+    print("%-26s %-12s %5s %7s %8s" % ("ACCOUNT", "STATE", "5H", "WEEKLY", "HEADROOM"))
+    print("-" * 63)
+    for a in sorted(pool.values(), key=lambda a: a.email):
+        five = "-" if a.usage_5h is None else "%d%%" % a.usage_5h
+        week = "-" if a.usage_week is None else "%d%%" % a.usage_week
+        headroom = "-" if a.usage_5h is None and a.usage_week is None else "%d%%" % a.headroom()
+        tag = {"allowed": "OK", "walled": "WALLED",
+               "needs_reauth": "REAUTH"}.get(a.state, a.state)
+        print("%-26s %-12s %5s %7s %8s" % (a.email[:26], tag, five, week, headroom))
+    usable = [a for a in pool.values() if a.state == "allowed"]
+    print("\nusable now: %d / %d  %s" % (
+        len(usable), len(pool), ", ".join(a.email for a in usable) or "(none)"))
+    print_status_fixes(pool, port, conflicts, skipped_refresh=not allow_status_refresh)
+
+
+def cmd_auth_log() -> None:
+    if not AUTH_EVENTS.exists():
+        print("no auth events yet: %s" % AUTH_EVENTS)
+        return
+    rows = collections.deque(maxlen=80)
+    with open(AUTH_EVENTS) as fh:
+        for line in fh:
+            if line.strip():
+                rows.append(line.rstrip("\n"))
+    for row in rows:
+        print(row)
+
+
+def cmd_stop() -> None:
+    rec = read_port_record() or {}
+    port = rec.get("port")
+    pid = rec.get("pid")
+    targets: List[int] = []
+    if isinstance(pid, int) and process_is_known_cxp_proxy(pid):
+        targets.append(pid)
+    elif isinstance(port, int):
+        listener_pid = find_pid_for_port(port)
+        if isinstance(listener_pid, int) and process_is_known_cxp_proxy(listener_pid):
+            targets.append(listener_pid)
+    targets.extend(find_known_proxy_pids())
+    targets = sorted({p for p in targets if p != os.getpid()})
+    if not targets:
+        with contextlib.suppress(Exception):
+            PORT_FILE.unlink()
+        print("proxy not running.")
+        return
+    for target in targets:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(target, signal.SIGTERM)
+    deadline = time.time() + 5
+    while any(pid_alive(target) for target in targets) and time.time() < deadline:
+        time.sleep(0.1)
+    # Escalate to SIGKILL for anything that ignored SIGTERM. Convergence (e.g.
+    # install-agent) MUST end with zero old proxies, or the new supervised proxy
+    # will guard-refuse to start and crash-only KeepAlive won't revive it.
+    stubborn = [target for target in targets if pid_alive(target)]
+    if stubborn:
+        for target in stubborn:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(target, signal.SIGKILL)
+        kill_deadline = time.time() + 3
+        while any(pid_alive(target) for target in stubborn) and time.time() < kill_deadline:
+            time.sleep(0.1)
+    with contextlib.suppress(Exception):
+        PORT_FILE.unlink()
+    alive = [target for target in targets if pid_alive(target)]
+    if alive:
+        print("WARNING: proxy pid(s) %s survived SIGTERM+SIGKILL; cleaned %s" %
+              (", ".join(str(p) for p in alive), PORT_FILE))
+    else:
+        print("stopped proxy pid(s) %s." % ", ".join(str(p) for p in targets))
+
+
+def cmd_restart() -> None:
+    cmd_stop()
+    port = ensure_proxy()
+    print("restarted proxy on 127.0.0.1:%d." % port)
+
+
+def cmd_quarantine() -> None:
+    import shutil
+    pooled_keys = set()
+    pooled_ids = set()
+    for key, _, doc in iter_pool_docs():
+        pooled_keys.add(key)
+        acct_id = ((doc.get("tokens") or {}).get("account_id") or "")
+        if acct_id:
+            pooled_ids.add(acct_id)
+    moves = []
+    for key in sorted(pooled_keys):
+        src = CODEX_ACCTS / (key + ".auth.json")
+        dst = CODEX_QUARANTINE / src.name
+        if src.exists():
+            moves.append((src, dst))
+    auth_move = False
+    active_id = None
+    with contextlib.suppress(Exception):
+        doc = json.loads(CODEX_AUTH.read_text())
+        active_id = (doc.get("tokens") or {}).get("account_id")
+        auth_move = bool(active_id and active_id in pooled_ids and CODEX_AUTH.exists())
+    print("quarantine: %d pooled account file(s), active auth move=%s" % (
+        len(moves), "yes" if auth_move else "no"))
+    if not moves and not auth_move:
+        print("nothing to move.")
+        return
+    CODEX_QUARANTINE.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(Exception):
+        os.chmod(CODEX_QUARANTINE, 0o700)
+    moved = []
+    for src, dst in moves:
+        aside = move_existing_aside(dst)
+        if aside:
+            print("move existing %s -> %s" % (dst, aside))
+        print("move %s -> %s" % (src, dst))
+        shutil.move(str(src), str(dst))
+        moved.append((src, dst))
+    if auth_move:
+        aside = move_existing_aside(CODEX_AUTH_BAK)
+        if aside:
+            print("move existing %s -> %s" % (CODEX_AUTH_BAK, aside))
+        print("move %s -> %s" % (CODEX_AUTH, CODEX_AUTH_BAK))
+        shutil.move(str(CODEX_AUTH), str(CODEX_AUTH_BAK))
+    elif CODEX_AUTH_BAK.exists() and not CODEX_AUTH.exists():
+        print("active auth already quarantined at %s" % CODEX_AUTH_BAK)
+    print("quarantine complete: moved %d account file(s)%s." % (
+        len(moved), " and auth.json" if auth_move else ""))
+    print("undo: run `cxp unquarantine`.")
+
+
+def cmd_unquarantine() -> None:
+    import shutil
+    pooled_keys = {key for key, _, _ in iter_pool_docs()}
+    restores = []
+    if CODEX_QUARANTINE.exists():
+        for src in sorted(CODEX_QUARANTINE.glob("*.auth.json")):
+            key = src.name[: -len(".auth.json")]
+            if key in pooled_keys:
+                restores.append((src, CODEX_ACCTS / src.name))
+    auth_restore = CODEX_AUTH_BAK.exists() and not CODEX_AUTH.exists()
+    print("unquarantine: %d pooled account file(s), active auth restore=%s" % (
+        len(restores), "yes" if auth_restore else "no"))
+    if not restores and not auth_restore:
+        print("nothing to restore.")
+        return
+    restored = []
+    for src, dst in restores:
+        if dst.exists():
+            continue
+        print("move %s -> %s" % (src, dst))
+        shutil.move(str(src), str(dst))
+        restored.append((src, dst))
+    if auth_restore:
+        print("move %s -> %s" % (CODEX_AUTH_BAK, CODEX_AUTH))
+        shutil.move(str(CODEX_AUTH_BAK), str(CODEX_AUTH))
+    print("unquarantine complete: restored %d account file(s)%s." % (
+        len(restored), " and auth.json" if auth_restore else ""))
+
+
+def cmd_install_agent() -> None:
+    import subprocess
+    ensure_dirs()
+    AGENT_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    source = pathlib.Path(os.path.realpath(__file__))
+    atomic_write_bytes(AGENT_PROGRAM, source.read_bytes(), mode=0o700)
+    program = str(AGENT_PROGRAM)
+    data = {
+        "Label": AGENT_LABEL,
+        "ProgramArguments": [program, "proxy"],
+        "RunAtLoad": True,
+        # Crash-only restart. With the hard singleton guard, a redundant launch
+        # exits cleanly (0); plain KeepAlive=True would respawn it forever in a
+        # busy-loop. SuccessfulExit:False restarts ONLY on a real crash.
+        "KeepAlive": {"SuccessfulExit": False},
+        "StandardOutPath": str(BASE / "agent.out.log"),
+        "StandardErrorPath": str(BASE / "agent.err.log"),
+    }
+    atomic_write_bytes(AGENT_PLIST, plistlib.dumps(data), mode=0o644)
+    subprocess.run(["launchctl", "unload", "-w", str(AGENT_PLIST)],
+                   check=False, capture_output=True, text=True)
+    cmd_stop()
+    cp = subprocess.run(["launchctl", "load", "-w", str(AGENT_PLIST)],
+                        check=False, capture_output=True, text=True)
+    if cp.returncode != 0:
+        print("launchctl load failed: %s" % ((cp.stderr or cp.stdout).strip() or cp.returncode))
+        return
+    print("installed %s at %s" % (AGENT_LABEL, AGENT_PLIST))
+    print("program: %s proxy" % program)
+    print("source: %s" % source)
+
+
+def cmd_uninstall_agent() -> None:
+    import subprocess
+    if AGENT_PLIST.exists():
+        cp = subprocess.run(["launchctl", "unload", "-w", str(AGENT_PLIST)],
+                            check=False, capture_output=True, text=True)
+        with contextlib.suppress(Exception):
+            AGENT_PLIST.unlink()
+        if cp.returncode == 0:
+            print("uninstalled %s." % AGENT_LABEL)
+        else:
+            print("launchctl unload returned %d; removed %s." %
+                  (cp.returncode, AGENT_PLIST))
+        return
+    print("%s is not installed." % AGENT_LABEL)
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    if args and args[0] == "proxy":
+        asyncio.run(run_proxy())
+    elif args and args[0] == "status":
+        cmd_status()
+    elif args and args[0] == "import":
+        ensure_dirs()
+        n = import_accounts()
+        n += import_active_auth()
+        print("imported %d new account(s); pool now has %d" % (n, len(load_pool())))
+    elif args and args[0] == "auth-log":
+        cmd_auth_log()
+    elif args and args[0] == "login":
+        cmd_login(args[1] if len(args) > 1 else None)
+    elif args and args[0] == "quarantine":
+        cmd_quarantine()
+    elif args and args[0] == "unquarantine":
+        cmd_unquarantine()
+    elif args and args[0] == "stop":
+        cmd_stop()
+    elif args and args[0] == "restart":
+        cmd_restart()
+    elif args and args[0] == "install-agent":
+        cmd_install_agent()
+    elif args and args[0] == "uninstall-agent":
+        cmd_uninstall_agent()
+    elif args and args[0] == "__codex":
+        # Transparent-shim entrypoint: launch codex through the pool with the
+        # caller's args verbatim and NO interactive preset. Unambiguous sentinel
+        # so codex's own subcommands (exec/login/...) never collide with cxp's.
+        launch(args[1:], apply_preset=False)
+    else:
+        launch(args)
+
+
+if __name__ == "__main__":
+    main()
