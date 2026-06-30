@@ -60,6 +60,34 @@ codex / omp (openai-codex provider)
 - **cxp** — the proxy + control CLI (one self-installing file; the launchd agent is a copy of it).
 - **cxp-bridge** — strictly-additive reachability guarantee: re-listens on free/old ports a running chat baked in at launch and pipes them to the current proxy. Only ever binds free ports; never kills or restarts anything.
 
+## Failover detection
+A turn fails over to a fresh account only when the proxy *recognizes* the wall.
+There are three detection paths, because ChatGPT signals a spent quota three
+different ways:
+1. **HTTP 429** with a quota code/message — caught before the body streams.
+2. **Early SSE error** — a quota event in the first 64 KB / 1.5 s of the stream,
+   before any output. The turn is rerouted in place.
+3. **Mid-stream SSE error** — ChatGPT delivers the 5h-window wall as an error
+   event *inside a 200 stream, after token output has already started*. The
+   in-flight turn can no longer be rerouted (bytes are already going to the
+   client), but the relay scans the whole stream (`scan_sse_for_quota`) and, on
+   a hit, flags the account walled so sticky affinity breaks and the **next**
+   turn moves to a healthy account.
+
+Path 3 matters: without it a single account pinned by affinity absorbs every
+retry against an exhausted 5h window — observed in the wild as tens of thousands
+of `[200]`s, zero detected walls, and no failover, while sibling accounts sat at
+full headroom. `cxp status` (which reads the usage endpoint directly) shows the
+account `WALLED`; the proxy must agree, mid-conversation, for the swap to fire.
+
+## Tests
+```bash
+python3 tests/test_wall_detection.py      # or: pytest tests/
+```
+`tests/test_wall_detection.py` locks in all three detection paths — including a
+test that *proves* the prefix scanner misses a mid-stream wall (the regression
+path 3 closes).
+
 ## Safety / hygiene
 - Never commit credentials. `.gitignore` excludes `accounts/`, `*.auth.json`, logs,
   ports, and `codex-home/`. The source contains **no** secrets.

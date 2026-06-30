@@ -387,6 +387,25 @@ def classify_sse_prefix(buf: bytes) -> Optional[str]:
     return reason
 
 
+def scan_sse_for_quota(buf: bytes) -> Optional[str]:
+    """Scan an SSE buffer for a quota/limit error event ANYWHERE in it.
+
+    Unlike scan_sse_prefix(), this does not bail at the first output event.
+    ChatGPT delivers the 5h-window wall as an SSE error event *after* output
+    has started, on a 200 response (never an HTTP 429), so the prefix scan
+    misses it. We use this on the live relay to flag the account walled for
+    the NEXT turn even though the current turn can no longer be rerouted.
+    """
+    for obj in iter_sse_json_events(buf):
+        ev_type = str(obj.get("type") or "")
+        code, message = extract_error_code_message(obj)
+        if ev_type in QUOTA_ERROR_TYPES or code or message:
+            if is_quota_signal(200, code, message,
+                               json.dumps(obj, separators=(",", ":"))):
+                return code or message or ev_type or "quota"
+    return None
+
+
 def extract_error_from_text(text: str) -> Tuple[Optional[str], Optional[str]]:
     with contextlib.suppress(Exception):
         obj = json.loads(text)
@@ -904,16 +923,39 @@ class Proxy:
             resp.headers[k] = v
         await resp.prepare(request)
         log("%s %s -> %s [%d]" % (request.method, path, acct.email, up.status))
+        # Keep watching the live stream for a quota/limit error event that
+        # arrives AFTER output started (ChatGPT's 5h wall on a 200 SSE). We
+        # can't reroute this turn, but flagging the account walled here breaks
+        # the sticky affinity so the next turn fails over to a fresh account.
+        is_sse = up.status == 200 and up.content_type == "text/event-stream"
+        midstream_wall = None
+        scan_tail = bytearray()
         try:
             if prefix:
                 await resp.write(bytes(prefix))
             source = prefix_iter if prefix_iter is not None else up.content.iter_any()
             async for chunk in source:
                 await resp.write(chunk)
+                if is_sse and midstream_wall is None and (
+                        b"error" in chunk or b"limit" in chunk
+                        or b"quota" in chunk or b"rate" in chunk):
+                    scan_tail.extend(chunk)
+                    if len(scan_tail) > SSE_PREFIX_MAX_BYTES:
+                        del scan_tail[:len(scan_tail) - SSE_PREFIX_MAX_BYTES]
+                    with contextlib.suppress(Exception):
+                        midstream_wall = scan_sse_for_quota(bytes(scan_tail))
         except Exception as e:
             log("stream interrupted %s: %s" % (path, e))
         finally:
             up.release()
+        # Final sweep: the wall event is often the last block before the stream
+        # closes, which the incremental scan may not have flushed.
+        if is_sse and midstream_wall is None and scan_tail:
+            with contextlib.suppress(Exception):
+                midstream_wall = scan_sse_for_quota(bytes(scan_tail) + b"\n\n")
+        if midstream_wall:
+            mark_account_walled(acct, path, midstream_wall)
+            self.routes.pop(tkey, None)
         with contextlib.suppress(Exception):
             await resp.write_eof()
         return resp
